@@ -30,7 +30,7 @@ const MAX_PAYLOAD_LEN: usize = 255;
 // TODO: Use a PDL struct to represent the headers and avoid hardcoding
 // lengths below.
 // Real UCI packet header len.
-const UCI_PACKET_HAL_HEADER_LEN: usize = 4;
+pub const UCI_PACKET_HAL_HEADER_LEN: usize = 4;
 // Unfragmented UCI packet header len.
 const UCI_PACKET_HEADER_LEN: usize = 7;
 
@@ -250,6 +250,22 @@ impl From<GroupIdOrDataPacketFormat> for GroupId {
     }
 }
 
+impl From<DataPacketFormat> for GroupIdOrDataPacketFormat {
+    fn from(dpf: DataPacketFormat) -> Self {
+        GroupIdOrDataPacketFormat::from_u8(dpf.to_u8().unwrap()).unwrap()
+    }
+}
+
+// The GroupIdOrDataPacketFormat enum has more values defined (for the GroupId bits) than the
+// DataPacketFormat enum. Hence this is implemented as TryFrom() instead of From().
+impl TryFrom<GroupIdOrDataPacketFormat> for DataPacketFormat {
+    type Error = Error;
+
+    fn try_from(gid_or_dpf: GroupIdOrDataPacketFormat) -> Result<Self> {
+        DataPacketFormat::from_u8(gid_or_dpf.to_u8().unwrap()).ok_or(Error::InvalidPacketError)
+    }
+}
+
 // Container for UCI packet header fields.
 struct UciControlPacketHeader {
     message_type: MessageType,
@@ -345,11 +361,52 @@ impl TryFrom<Vec<UciPacketHalPacket>> for UciControlPacketPacket {
     }
 }
 
+// UCI Data packet functions.
+fn is_uci_data_rcv_packet(message_type: MessageType, data_packet_format: DataPacketFormat) -> bool {
+    message_type == MessageType::Data && data_packet_format == DataPacketFormat::DataRcv
+}
+
+fn try_into_data_payload(packet: UciPacketHalPacket) -> Result<Bytes> {
+    if is_uci_data_rcv_packet(
+        packet.get_message_type(),
+        packet.get_group_id_or_data_packet_format().try_into()?,
+    ) {
+        Ok(packet.to_bytes().slice(UCI_PACKET_HAL_HEADER_LEN..))
+    } else {
+        error!("Received unexpected data packet fragment: {:?}", packet);
+        Err(Error::InvalidPacketError)
+    }
+}
+
+// Helper to convert from vector of |UciPacketHalPacket| to |UciDataPacketPacket|. An example
+// usage is to convert a list UciPacketHAL fragments to one UciPacket, during de-fragmentation.
 impl TryFrom<Vec<UciPacketHalPacket>> for UciDataPacketPacket {
     type Error = Error;
 
     fn try_from(packets: Vec<UciPacketHalPacket>) -> Result<Self> {
-        todo!("b/261762781: Implement de-fragmentation for Uci Data packets")
+        if packets.is_empty() {
+            return Err(Error::InvalidPacketError);
+        }
+
+        // Create the reassembled payload.
+        let mut payload_buf = Bytes::new();
+        for packet in packets {
+            // Ensure that the fragment is a Data Rcv packet.
+            // Get payload by stripping the header.
+            payload_buf = [payload_buf, try_into_data_payload(packet)?].concat().into();
+        }
+
+        // Create assembled |UciDataPacketPacket| and convert to bytes again since we need to
+        // reparse the packet after defragmentation to get the appropriate message.
+        UciDataPacketPacket::parse(
+            &UciDataPacketBuilder {
+                message_type: MessageType::Data,
+                data_packet_format: DataPacketFormat::DataRcv,
+                payload: Some(payload_buf.into()),
+            }
+            .build()
+            .to_bytes(),
+        )
     }
 }
 
@@ -425,8 +482,13 @@ pub struct PacketDefrager {
     data_fragment_cache: Vec<UciPacketHalPacket>,
 }
 
+pub enum UciDefragPacket {
+    Control(UciControlPacketPacket),
+    Data(UciDataPacketPacket),
+}
+
 impl PacketDefrager {
-    pub fn defragment_packet(&mut self, msg: &[u8]) -> Option<UciControlPacketPacket> {
+    pub fn defragment_packet(&mut self, msg: &[u8]) -> Option<UciDefragPacket> {
         let packet = UciPacketHalPacket::parse(msg)
             .or_else(|e| {
                 error!("Failed to parse packet: {:?}", e);
@@ -435,24 +497,42 @@ impl PacketDefrager {
             .ok()?;
 
         let pbf = packet.get_packet_boundary_flag();
+
+        // TODO(b/261762781): The current implementation allows for the possibility that we receive
+        // interleaved Control/Data HAL packets, and so uses separate caches for them. In the
+        // future, if we determine that interleaving is not possible, this can be simplified.
         if is_uci_control_packet(packet.get_message_type()) {
-            // Add the incoming fragment to the packet cache.
+            // Add the incoming fragment to the control packet cache.
             self.control_fragment_cache.push(packet);
             if pbf == PacketBoundaryFlag::NotComplete {
                 // Wait for remaining fragments.
                 return None;
             }
-            // All fragments received, defragment the packet.
+
+            // All fragments received, defragment the control packet.
             match self.control_fragment_cache.drain(..).collect::<Vec<_>>().try_into() {
-                Ok(packet) => Some(packet),
+                Ok(packet) => Some(UciDefragPacket::Control(packet)),
                 Err(e) => {
-                    error!("Failed to defragment packet: {:?}", e);
+                    error!("Failed to defragment control packet: {:?}", e);
                     None
                 }
             }
         } else {
-            // TODO(b/261762781): Implement de-fragmentation for Uci Data packets
-            None
+            // Add the incoming fragment to the data packet cache.
+            self.data_fragment_cache.push(packet);
+            if pbf == PacketBoundaryFlag::NotComplete {
+                // Wait for remaining fragments.
+                return None;
+            }
+
+            // All fragments received, defragment the data packet.
+            match self.data_fragment_cache.drain(..).collect::<Vec<_>>().try_into() {
+                Ok(packet) => Some(UciDefragPacket::Data(packet)),
+                Err(e) => {
+                    error!("Failed to defragment data packet: {:?}", e);
+                    None
+                }
+            }
         }
     }
 }
@@ -526,8 +606,8 @@ pub fn parse_diagnostics_ntf(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ControleesV2 {
-    NoSessionKey(Vec<Controlee_V2_0_0_Byte_Version>),
+pub enum Controlees {
+    NoSessionKey(Vec<Controlee>),
     ShortSessionKey(Vec<Controlee_V2_0_16_Byte_Version>),
     LongSessionKey(Vec<Controlee_V2_0_32_Byte_Version>),
 }
@@ -542,25 +622,12 @@ pub fn write_controlee(controlee: &Controlee) -> BytesMut {
     buffer
 }
 
-pub fn write_controlee_2_0_0byte(controlee: &Controlee_V2_0_0_Byte_Version) -> BytesMut {
-    let mut buffer = BytesMut::new();
-    let short_address = controlee.short_address;
-    buffer.extend_from_slice(&short_address.to_le_bytes()[0..2]);
-    let subsession_id = controlee.subsession_id;
-    buffer.extend_from_slice(&subsession_id.to_le_bytes()[0..4]);
-    let message_control = controlee.message_control.to_u8().unwrap();
-    buffer.extend_from_slice(&message_control.to_le_bytes()[0..1]);
-    buffer
-}
-
 pub fn write_controlee_2_0_16byte(controlee: &Controlee_V2_0_16_Byte_Version) -> BytesMut {
     let mut buffer = BytesMut::new();
     let short_address = controlee.short_address;
     buffer.extend_from_slice(&short_address.to_le_bytes()[0..2]);
     let subsession_id = controlee.subsession_id;
     buffer.extend_from_slice(&subsession_id.to_le_bytes()[0..4]);
-    let message_control = controlee.message_control.to_u8().unwrap();
-    buffer.extend_from_slice(&message_control.to_le_bytes()[0..1]);
     buffer.extend_from_slice(&controlee.subsession_key);
     buffer
 }
@@ -571,70 +638,54 @@ pub fn write_controlee_2_0_32byte(controlee: &Controlee_V2_0_32_Byte_Version) ->
     buffer.extend_from_slice(&short_address.to_le_bytes()[0..2]);
     let subsession_id = controlee.subsession_id;
     buffer.extend_from_slice(&subsession_id.to_le_bytes()[0..4]);
-    let message_control = controlee.message_control.to_u8().unwrap();
-    buffer.extend_from_slice(&message_control.to_le_bytes()[0..1]);
     buffer.extend_from_slice(&controlee.subsession_key);
     buffer
 }
 
-/// Generate the V1 SessionUpdateControllerMulticastListCmd packet.
+/// Generate the SessionUpdateControllerMulticastListCmd packet.
 ///
-/// Workaround for handling the non-compatible command.
-/// Size check omitted and UCI spec compliancy is up to the caller of the method.
-pub fn build_session_update_controller_multicast_list_cmd_v1(
+/// This function can build the packet with/without message control, which
+/// is indicated by action parameter.
+pub fn build_session_update_controller_multicast_list_cmd(
     session_id: u32,
     action: UpdateMulticastListAction,
-    controlees: Vec<Controlee>,
-) -> SessionUpdateControllerMulticastListCmdPacket {
-    let mut controlees_buf = BytesMut::new();
-    controlees_buf.extend_from_slice(&(controlees.len() as u8).to_le_bytes());
-    for controlee in controlees {
-        controlees_buf.extend_from_slice(&write_controlee(&controlee));
-    }
-    SessionUpdateControllerMulticastListCmdBuilder {
-        session_id,
-        action,
-        payload: Some(controlees_buf.freeze()),
-    }
-    .build()
-}
-
-/// Generate the V2 SessionUpdateControllerMulticastListCmd packet.
-///
-/// Workaround for handling the non-compatible command.
-/// Size check omitted and UCI spec compliancy is up to the caller of the method.
-pub fn build_session_update_controller_multicast_list_cmd_v2(
-    session_id: u32,
-    action: UpdateMulticastListAction,
-    controlees: ControleesV2,
-) -> SessionUpdateControllerMulticastListCmdPacket {
+    controlees: Controlees,
+) -> Result<SessionUpdateControllerMulticastListCmdPacket> {
     let mut controlees_buf = BytesMut::new();
     match controlees {
-        ControleesV2::NoSessionKey(controlee_v2) => {
-            controlees_buf.extend_from_slice(&(controlee_v2.len() as u8).to_le_bytes());
-            for controlee in controlee_v2 {
-                controlees_buf.extend_from_slice(&write_controlee_2_0_0byte(&controlee));
+        Controlees::NoSessionKey(controlee_v1)
+            if action == UpdateMulticastListAction::AddControlee
+                || action == UpdateMulticastListAction::RemoveControlee =>
+        {
+            controlees_buf.extend_from_slice(&(controlee_v1.len() as u8).to_le_bytes());
+            for controlee in controlee_v1 {
+                controlees_buf.extend_from_slice(&write_controlee(&controlee));
             }
         }
-        ControleesV2::ShortSessionKey(controlee_v2) => {
+        Controlees::ShortSessionKey(controlee_v2)
+            if action == UpdateMulticastListAction::AddControleeWithShortSubSessionKey =>
+        {
             controlees_buf.extend_from_slice(&(controlee_v2.len() as u8).to_le_bytes());
             for controlee in controlee_v2 {
                 controlees_buf.extend_from_slice(&write_controlee_2_0_16byte(&controlee));
             }
         }
-        ControleesV2::LongSessionKey(controlee_v2) => {
+        Controlees::LongSessionKey(controlee_v2)
+            if action == UpdateMulticastListAction::AddControleeWithLongSubSessionKey =>
+        {
             controlees_buf.extend_from_slice(&(controlee_v2.len() as u8).to_le_bytes());
             for controlee in controlee_v2 {
                 controlees_buf.extend_from_slice(&write_controlee_2_0_32byte(&controlee));
             }
         }
+        _ => return Err(Error::InvalidPacketError),
     }
-    SessionUpdateControllerMulticastListCmdBuilder {
+    Ok(SessionUpdateControllerMulticastListCmdBuilder {
         session_id,
         action,
         payload: Some(controlees_buf.freeze()),
     }
-    .build()
+    .build())
 }
 
 impl Drop for AppConfigTlv {
@@ -698,13 +749,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_multicast_update_v1_packet() {
+    fn test_build_multicast_update_packet() {
         let controlee = Controlee { short_address: 0x1234, subsession_id: 0x1324_3546 };
-        let packet: UciControlPacketPacket = build_session_update_controller_multicast_list_cmd_v1(
+        let packet: UciControlPacketPacket = build_session_update_controller_multicast_list_cmd(
             0x1425_3647,
             UpdateMulticastListAction::AddControlee,
-            vec![controlee; 1],
+            Controlees::NoSessionKey(vec![controlee; 1]),
         )
+        .unwrap()
         .into();
         let packet_fragments: Vec<UciControlPacketHalPacket> = packet.into();
         let uci_packet: Vec<u8> = packet_fragments[0].clone().into();
